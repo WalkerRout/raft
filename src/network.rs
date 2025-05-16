@@ -23,6 +23,9 @@ pub enum NetworkError {
 
   #[error("failed to send, removing peer '{0}' connection")]
   PeerConnectionAborted(NodeId),
+
+  #[error("failed to decode message from bytes")]
+  MessageDecodeFailure,
 }
 
 pub struct Network {
@@ -77,9 +80,9 @@ impl Network {
   }
 
   pub async fn send_message(&self, peer_id: NodeId, message: Message) -> Result<(), NetworkError> {
+    let encoded = bincode::serialize(&message).map_err(|_| NetworkError::MessageDecodeFailure)?;
     let mut connections = self.connections.lock().await;
     if let Some(stream) = connections.get_mut(&peer_id) {
-      let encoded = bincode::serialize(&message).unwrap();
       if stream.write_all(&encoded).await.is_err() {
         connections.remove(&peer_id); // causes reconnect task to kick in
         Err(NetworkError::PeerConnectionAborted(peer_id))

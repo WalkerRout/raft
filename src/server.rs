@@ -419,7 +419,7 @@ impl Server {
   #[instrument(skip(self), fields(node = %self.id))]
   pub async fn spin(mut self) {
     loop {
-      let inner = self.inner.take().unwrap();
+      let inner = self.inner.take().expect("inner should always be present");
       self.inner = Some(inner.step().await);
     }
   }

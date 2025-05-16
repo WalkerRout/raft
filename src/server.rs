@@ -1,12 +1,15 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant, interval, sleep};
+use rand::Rng;
 
 use serde::{Deserialize, Serialize};
 
-use rand::Rng;
+use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, interval, sleep, timeout};
+
+use tracing::instrument;
+use tracing::{info, warn};
 
 use uuid::Uuid;
 
@@ -16,7 +19,10 @@ pub type NodeId = Uuid;
 
 pub struct Follower;
 
-pub struct Candidate;
+#[derive(Default)]
+pub struct Candidate {
+  vote_count: usize,
+}
 
 pub struct Leader;
 
@@ -33,10 +39,22 @@ pub enum Message {
   Vote { term: u64, granted: bool },
 }
 
-pub trait Run {
+pub trait Step {
   type Conclusion;
 
-  fn run(self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>>;
+  fn step(self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>>;
+}
+
+#[allow(dead_code)]
+enum TransitionTo {
+  Follower,
+  Candidate,
+  Leader,
+}
+
+fn random_election_timeout() -> Duration {
+  let millis = rand::rng().random_range(150..300);
+  Duration::from_millis(millis)
 }
 
 pub struct StateMachine<S> {
@@ -46,7 +64,7 @@ pub struct StateMachine<S> {
   peer_ids: Vec<NodeId>,
   network: Arc<Network>,
   rx: mpsc::Receiver<Message>,
-  _state: S,
+  state: S,
 }
 
 impl<S> StateMachine<S> {
@@ -58,14 +76,101 @@ impl<S> StateMachine<S> {
       peer_ids: self.peer_ids,
       network: self.network,
       rx: self.rx,
-      _state: new_state,
+      state: new_state,
     }
   }
 }
 
 impl StateMachine<Follower> {
   fn into_candidate(self) -> StateMachine<Candidate> {
-    self.transfer_to(Candidate)
+    self.transfer_to(Candidate::default())
+  }
+}
+
+impl StateMachine<Follower> {
+  async fn handle_follower_message(&mut self, msg: Message) -> Option<TransitionTo> {
+    match msg {
+      Message::AppendEntries(ae) => {
+        if ae.term >= self.current_term {
+          self.current_term = ae.term;
+          self.voted_for = None;
+          info!("got heartbeat from leader {}", ae.leader_id);
+        }
+        None // restart timer
+      }
+
+      Message::RequestVote { term, candidate_id } => {
+        if term > self.current_term {
+          self.current_term = term;
+          self.voted_for = Some(candidate_id);
+          let _ = self
+            .network
+            .send_message(
+              candidate_id,
+              Message::Vote {
+                term,
+                granted: true,
+              },
+            )
+            .await;
+          info!("voted for {}", candidate_id);
+        } else if term == self.current_term && self.voted_for.is_none() {
+          self.voted_for = Some(candidate_id);
+          let _ = self
+            .network
+            .send_message(
+              candidate_id,
+              Message::Vote {
+                term,
+                granted: true,
+              },
+            )
+            .await;
+          info!("voted for {} (same term)", candidate_id);
+        } else {
+          let _ = self
+            .network
+            .send_message(
+              candidate_id,
+              Message::Vote {
+                term,
+                granted: false,
+              },
+            )
+            .await;
+          info!("rejected vote for {}", candidate_id);
+        }
+        None
+      }
+
+      _ => None,
+    }
+  }
+}
+
+impl Step for StateMachine<Follower> {
+  type Conclusion = DynamicServer;
+
+  fn step(mut self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
+    Box::pin(async move {
+      info!("running as Follower (term {})", self.current_term);
+
+      loop {
+        let timeout = random_election_timeout();
+        let timer = sleep(timeout);
+
+        tokio::select! {
+          _ = timer => {
+            info!("election timeout");
+            return self.into_candidate().into();
+          },
+          Some(msg) = self.rx.recv() => {
+            // followers dont transition through message handling as of yet
+            let _ = self.handle_follower_message(msg).await;
+          }
+        }
+      }
+    })
   }
 }
 
@@ -79,173 +184,160 @@ impl StateMachine<Candidate> {
   }
 }
 
-impl StateMachine<Leader> {
-  fn into_follower(self) -> StateMachine<Follower> {
-    self.transfer_to(Follower)
-  }
-}
+impl StateMachine<Candidate> {
+  async fn start_election(&mut self) {
+    self.current_term += 1;
+    self.voted_for = Some(self.id);
+    self.state.vote_count = 1; // voted for self
+    info!("starting election for term {}", self.current_term);
 
-impl Run for StateMachine<Follower> {
-  type Conclusion = DynamicServer;
-
-  fn run(mut self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
-    Box::pin(async move {
-      println!(
-        "Node {}: running as Follower (term {})",
-        self.id, self.current_term
-      );
-      loop {
-        let timeout = rand::rng().random_range(150..300);
-        let timer = sleep(Duration::from_millis(timeout));
-        tokio::select! {
-          _ = timer => {
-            println!("Node {}: election timeout", self.id);
-            return self.into_candidate().into();
+    for peer_id in &self.peer_ids {
+      if let Err(e) = self
+        .network
+        .send_message(
+          *peer_id,
+          Message::RequestVote {
+            term: self.current_term,
+            candidate_id: self.id,
           },
-          Some(msg) = self.rx.recv() => {
-            match msg {
-              Message::AppendEntries(ae) => {
-                if ae.term >= self.current_term {
-                  self.current_term = ae.term;
-                  self.voted_for = None;
-                  println!("Node {}: got heartbeat from leader {}", self.id, ae.leader_id);
-                  // Restart the follower timer
-                  continue; // re-enters loop with a fresh timer
-                }
-              },
-              Message::RequestVote { term, candidate_id } => {
-                if term > self.current_term {
-                  self.current_term = term;
-                  self.voted_for = Some(candidate_id);
-                  let _ = self.network
-                    .send_message(candidate_id, Message::Vote {
-                      term,
-                      granted: true
-                    })
-                    .await;
-                  println!("Node {}: voted for {}", self.id, candidate_id);
-                }
-              },
-              _ => {}
-            }
+        )
+        .await
+      {
+        let _ = e; // warn!("failed to send message to {}: {}", peer_id, e);
+      }
+    }
+  }
+
+  async fn handle_candidate_message(&mut self, msg: Message) -> Option<TransitionTo> {
+    match msg {
+      Message::Vote { term, granted } => {
+        if term == self.current_term && granted {
+          self.state.vote_count += 1;
+          if self.state.vote_count > self.peer_ids.len().div_ceil(2) {
+            info!("became leader!");
+            Some(TransitionTo::Leader)
+          } else {
+            None
           }
+        } else {
+          None
         }
       }
-    }) // end of pinned future
+
+      Message::AppendEntries(ae) => {
+        if ae.term >= self.current_term {
+          info!("stepping down to follower");
+          self.current_term = ae.term;
+          Some(TransitionTo::Follower)
+        } else {
+          None
+        }
+      }
+
+      Message::RequestVote { term, candidate_id } => {
+        if term > self.current_term {
+          info!(
+            "stepping down due to higher term {} from {}",
+            term, candidate_id
+          );
+          self.current_term = term;
+          Some(TransitionTo::Follower)
+        } else {
+          None
+        }
+      }
+    }
   }
 }
 
-impl Run for StateMachine<Candidate> {
+impl Step for StateMachine<Candidate> {
   type Conclusion = DynamicServer;
 
-  fn run(mut self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
+  fn step(mut self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
     Box::pin(async move {
-      self.current_term += 1;
-      self.voted_for = Some(self.id);
-      let mut votes = 1; // voted for self
-      println!(
-        "Node {}: starting election for term {}",
-        self.id, self.current_term
-      );
+      self.start_election().await;
+      let election_deadline = Instant::now() + random_election_timeout();
 
-      for peer_id in &self.peer_ids {
-        let _ = self
-          .network
-          .send_message(
-            *peer_id,
-            Message::RequestVote {
-              term: self.current_term,
-              candidate_id: self.id,
-            },
-          )
-          .await;
-      }
-
-      let election_timeout =
-        Instant::now() + Duration::from_millis(rand::rng().random_range(150..300));
-
-      while Instant::now() < election_timeout {
+      while Instant::now() < election_deadline {
         tokio::select! {
           Some(msg) = self.rx.recv() => {
-            match msg {
-              Message::Vote { term, granted } => {
-                if term == self.current_term && granted {
-                  votes += 1;
-                  if votes > 1 {
-                    println!("Node {}: became leader!", self.id);
-                    return self.into_leader().into();
-                  }
-                }
-              }
-              Message::AppendEntries(ae) => {
-                if ae.term >= self.current_term {
-                  println!("Node {}: stepping down to follower", self.id);
-                  self.current_term = ae.term;
-                  return self.into_follower().into();
-                }
-              }
-              Message::RequestVote { term, candidate_id } => {
-                if term > self.current_term {
-                  println!("Node {}: stepping down due to higher term {} from {}", self.id, term, candidate_id);
-                  self.current_term = term;
-                  return self.into_follower().into();
-                }
-              }
-            }
-          },
+            return match self.handle_candidate_message(msg).await {
+              Some(TransitionTo::Leader) => self.into_leader().into(),
+              Some(TransitionTo::Follower) => self.into_follower().into(),
+              // this is kinda hacky, we avoid returning by continuing...
+              _ => continue,
+            };
+          }
           _ = sleep(Duration::from_millis(10)) => {}
         }
       }
 
-      println!("Node {}: election failed, retrying...", self.id);
+      warn!("election failed, retrying...");
 
       self.into()
     })
   }
 }
 
-impl Run for StateMachine<Leader> {
+impl StateMachine<Leader> {
+  fn into_follower(self) -> StateMachine<Follower> {
+    self.transfer_to(Follower)
+  }
+}
+
+impl StateMachine<Leader> {
+  async fn handle_leader_message(&mut self, msg: Message) -> Option<TransitionTo> {
+    match msg {
+      Message::AppendEntries(ae) if ae.term > self.current_term => {
+        info!(
+          "stepping down, new leader {} (term {})",
+          ae.leader_id, ae.term
+        );
+        self.current_term = ae.term;
+        Some(TransitionTo::Follower)
+      }
+      _ => None,
+    }
+  }
+
+  async fn beat_heart(&self) {
+    for peer_id in &self.peer_ids {
+      if let Err(e) = self
+        .network
+        .send_message(
+          *peer_id,
+          Message::AppendEntries(AppendEntries {
+            term: self.current_term,
+            leader_id: self.id,
+          }),
+        )
+        .await
+      {
+        let _ = e; // warn!("failed to send message to {}: {}", peer_id, e);
+      }
+    }
+    info!("sent heartbeat");
+  }
+}
+
+impl Step for StateMachine<Leader> {
   type Conclusion = DynamicServer;
 
-  fn run(mut self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
+  fn step(mut self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
     Box::pin(async move {
       let mut ticker = interval(Duration::from_millis(100));
       loop {
         ticker.tick().await;
-        // heartbeat
-        for &peer_id in &self.peer_ids {
-          let _ = self
-            .network
-            .send_message(
-              peer_id,
-              Message::AppendEntries(AppendEntries {
-                term: self.current_term,
-                leader_id: self.id,
-              }),
-            )
-            .await;
-        }
-        println!("Node {}: sent heartbeat", self.id);
-
-        //let timeout = rand::thread_rng().gen_range(150..300);
-        //let mut timer = sleep(Duration::from_millis(timeout)).await;
-
-        while let Ok(Some(msg)) =
-          tokio::time::timeout(Duration::from_millis(5), self.rx.recv()).await
-        {
-          if let Message::AppendEntries(ae) = msg {
-            if ae.term > self.current_term {
-              println!(
-                "Node {}: stepping down, new leader {}",
-                self.id, ae.leader_id
-              );
-              self.current_term = ae.term;
-              return self.into_follower().into();
-            }
-          }
+        // send out heartbeat to all connected nodes
+        self.beat_heart().await;
+        while let Ok(Some(msg)) = timeout(Duration::from_millis(5), self.rx.recv()).await {
+          return match self.handle_leader_message(msg).await {
+            Some(TransitionTo::Follower) => self.into_follower().into(),
+            _ => continue,
+          };
         }
       }
-    }) // end of pinned future
+    })
   }
 }
 
@@ -269,20 +361,20 @@ impl DynamicServer {
       network,
       peer_ids,
       rx,
-      _state: Follower,
+      state: Follower,
     })
   }
 }
 
-impl Run for DynamicServer {
+impl Step for DynamicServer {
   type Conclusion = Self;
 
-  fn run(self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
+  fn step(self) -> Pin<Box<dyn Future<Output = Self::Conclusion>>> {
     Box::pin(async move {
       match self {
-        Self::Follower(srv) => srv.run().await,
-        Self::Candidate(srv) => srv.run().await,
-        Self::Leader(srv) => srv.run().await,
+        Self::Follower(srv) => srv.step().await,
+        Self::Candidate(srv) => srv.step().await,
+        Self::Leader(srv) => srv.step().await,
       }
     })
   }
@@ -307,6 +399,7 @@ impl From<StateMachine<Leader>> for DynamicServer {
 }
 
 pub struct Server {
+  id: NodeId,
   inner: Option<DynamicServer>,
 }
 
@@ -318,14 +411,16 @@ impl Server {
     rx: mpsc::Receiver<Message>,
   ) -> Self {
     Self {
+      id,
       inner: Some(DynamicServer::new(id, network, peer_ids, rx)),
     }
   }
 
+  #[instrument(skip(self), fields(node = %self.id))]
   pub async fn spin(mut self) {
     loop {
       let inner = self.inner.take().unwrap();
-      self.inner = Some(inner.run().await);
+      self.inner = Some(inner.step().await);
     }
   }
 }

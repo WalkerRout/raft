@@ -5,12 +5,16 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use uuid::Uuid;
-
+use tokio::signal;
 use tokio::sync::mpsc;
 
-use raft::server::{NodeId, Server};
+use tracing::info;
+use tracing_subscriber::filter::LevelFilter;
+
+use uuid::Uuid;
+
 use raft::network::Network;
+use raft::server::{NodeId, Server};
 
 #[derive(thiserror::Error, Debug)]
 enum PeerError {
@@ -59,6 +63,15 @@ struct CliArgs {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), anyhow::Error> {
+  tracing_subscriber::fmt()
+    .with_max_level(LevelFilter::INFO)
+    .with_target(false)
+    .with_thread_ids(true)
+    .with_ansi(true)
+    .init();
+
+  log_panics::init();
+
   let args = CliArgs::parse();
 
   let mut peer_map = HashMap::new();
@@ -73,7 +86,12 @@ async fn main() -> Result<(), anyhow::Error> {
   let network = Arc::new(Network::new(args.addr, peer_map, tx).await?);
   let node = Server::new(args.id, Arc::clone(&network), peer_ids, rx);
 
-  node.spin().await;
+  info!("server spinning up...");
+  tokio::select! {
+    _ = signal::ctrl_c() => {},
+    _ = node.spin() => {},
+  }
+  info!("server spinning down...");
 
   Ok(())
 }

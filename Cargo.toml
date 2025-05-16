@@ -4,12 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
-bincode = "1.0.0"
+# arg parsing
 clap = { version = "4.5.38", features = ["derive"] }
-rand = "0.9.1"
-serde = { version = "1.0.219", features = ["derive"] }
+# error handling
+anyhow = "1.0.98"
 thiserror = "2.0.12"
+# networking/infrastructure
 tokio = { version = "1.44.2", features = ["rt", "macros", "net", "time", "signal", "io-util"] }
 tokio-util = "0.7.15"
+# logging
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+# encoding/decoding
+serde = { version = "1.0.219", features = ["derive"] }
+bincode = "1.0.0"
+# util
+rand = "0.9.1"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
+log-panics = "2.1.0"

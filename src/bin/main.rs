@@ -18,7 +18,7 @@ use raft::server::{NodeId, Server};
 
 #[derive(thiserror::Error, Debug)]
 enum PeerError {
-  #[error("failed to parse peer string, expected format <peer_id>:<peer_addr>")]
+  #[error("failed to parse peer string, expected format <peer_id>:<peer_ip>:<peer_port>")]
   StringParseFailure,
 }
 

@@ -40,37 +40,17 @@ impl Network {
     peers: HashMap<NodeId, SocketAddr>,
     tx: mpsc::Sender<Message>,
   ) -> Result<Self, NetworkError> {
+    let connections = Arc::new(Mutex::new(HashMap::new()));
     let listener = TcpListener::bind(addr)
       .await
       .map_err(|_| NetworkError::AddressListenFailure(addr))?;
     let task_tx = tx.clone();
 
     let mut tasks = JoinSet::new();
-    tasks.spawn(
-      async move {
-        let mut subtasks = JoinSet::new();
-        loop {
-          let (socket, _) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-              warn!("failed to accept connection: {}", e);
-              continue;
-            }
-          };
-
-          let subtask_tx = task_tx.clone();
-          subtasks.spawn(handle_connection(socket, subtask_tx).instrument(Span::current()));
-        }
-      }
-      .instrument(Span::current()),
-    );
-
-    let connections = Arc::new(Mutex::new(HashMap::new()));
-
-    for (&peer_id, &peer_addr) in &peers {
+    tasks.spawn(listen_for_peers(listener, task_tx).instrument(Span::current()));
+    for (&id, &addr) in &peers {
       let task_connections = Arc::clone(&connections);
-      tasks
-        .spawn(connect_to_peer(task_connections, peer_id, peer_addr).instrument(Span::current()));
+      tasks.spawn(connect_to_peer(task_connections, id, addr).instrument(Span::current()));
     }
 
     Ok(Self {
@@ -92,6 +72,21 @@ impl Network {
     } else {
       Err(NetworkError::PeerNotConnected)
     }
+  }
+}
+
+async fn listen_for_peers(listener: TcpListener, task_tx: mpsc::Sender<Message>) {
+  let mut subtasks = JoinSet::new();
+  loop {
+    let (socket, _) = match listener.accept().await {
+      Ok(s) => s,
+      Err(e) => {
+        warn!("failed to accept connection: {}", e);
+        continue;
+      }
+    };
+    let subtask_tx = task_tx.clone();
+    subtasks.spawn(handle_connection(socket, subtask_tx).instrument(Span::current()));
   }
 }
 

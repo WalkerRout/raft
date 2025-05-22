@@ -84,7 +84,7 @@ async fn main() -> Result<(), anyhow::Error> {
   let (tx, rx) = mpsc::channel(1024);
 
   let network = Arc::new(Network::new(args.addr, peer_map, tx).await?);
-  let node = Server::new(args.id, Arc::clone(&network), peer_ids, rx);
+  let node = Server::new(args.id, network, peer_ids, rx);
 
   info!("server spinning up...");
   tokio::select! {

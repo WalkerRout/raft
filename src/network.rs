@@ -64,6 +64,10 @@ impl Network {
     let mut connections = self.connections.lock().await;
     if let Some(stream) = connections.get_mut(&peer_id) {
       if stream.write_all(&encoded).await.is_err() {
+        // really want to make this lock free...
+        //
+        // we hold the connections lock across await points, so we use tokio's
+        // mutex instead of std's
         connections.remove(&peer_id); // causes reconnect task to kick in
         Err(NetworkError::PeerConnectionAborted(peer_id))
       } else {
